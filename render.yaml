@@ -1,0 +1,182 @@
+# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
+
+previews:
+  generation: off
+
+projects:
+  - name: firecrawl
+    environments:
+      - name: production
+        services:
+          - type: web
+            name: firecrawl-api
+            runtime: docker
+            plan: pro
+            region: oregon
+            # Thin Dockerfile wrapper over ghcr.io/firecrawl/firecrawl:latest.
+            # Pin the upstream tag by changing the FROM line in ./Dockerfile.
+            dockerfilePath: ./Dockerfile
+            dockerContext: .
+            healthCheckPath: /v0/health/liveness
+            envVars:
+              - key: PORT
+                value: "3002"
+              - key: HOST
+                value: 0.0.0.0
+              - key: USE_DB_AUTHENTICATION
+                value: "false"
+              - key: LOGGING_LEVEL
+                value: info
+              # Reduced from upstream defaults to fit the 4 GB pro plan.
+              # Bump these (and the plan) for higher throughput.
+              - key: NUQ_WORKER_COUNT
+                value: "2"
+              - key: NUM_WORKERS_PER_QUEUE
+                value: "4"
+              - key: CRAWL_CONCURRENT_REQUESTS
+                value: "5"
+              - key: MAX_CONCURRENT_JOBS
+                value: "3"
+              - key: BROWSER_POOL_SIZE
+                value: "3"
+              - key: MAX_CPU
+                value: "0.8"
+              - key: MAX_RAM
+                value: "0.8"
+              # Wired automatically to sibling services over the private network.
+              # Render assigns each pserv a suffixed slug (e.g.
+              # firecrawl-postgres-ab12); fromService.host returns the real
+              # slug. The entrypoint.sh in the wrapper image hardcodes the
+              # well-known ports (5672 AMQP, 3000 Playwright) because Render's
+              # pserv port detection picks 15672 (mgmt UI) on the rabbitmq
+              # image, which would make the api speak AMQP to the HTTP port.
+              - key: PLAYWRIGHT_HOST
+                fromService:
+                  type: pserv
+                  name: firecrawl-playwright
+                  property: host
+              - key: NUQ_RABBITMQ_HOST
+                fromService:
+                  type: pserv
+                  name: firecrawl-rabbitmq
+                  property: host
+              - key: REDIS_URL
+                fromService:
+                  type: keyvalue
+                  name: firecrawl-redis
+                  property: connectionString
+              - key: REDIS_RATE_LIMIT_URL
+                fromService:
+                  type: keyvalue
+                  name: firecrawl-redis
+                  property: connectionString
+              - key: POSTGRES_HOST
+                fromService:
+                  type: pserv
+                  name: firecrawl-postgres
+                  property: host
+              - key: POSTGRES_PORT
+                value: "5432"
+              - key: POSTGRES_DB
+                fromService:
+                  type: pserv
+                  name: firecrawl-postgres
+                  envVarKey: POSTGRES_DB
+              - key: POSTGRES_USER
+                fromService:
+                  type: pserv
+                  name: firecrawl-postgres
+                  envVarKey: POSTGRES_USER
+              - key: POSTGRES_PASSWORD
+                fromService:
+                  type: pserv
+                  name: firecrawl-postgres
+                  envVarKey: POSTGRES_PASSWORD
+              # Protects the Bull admin UI at /admin/$BULL_AUTH_KEY/queues.
+              # Render generates this once; do not rotate without redeploying.
+              - key: BULL_AUTH_KEY
+                generateValue: true
+              # Optional: paste an OpenAI key in the dashboard to enable JSON
+              # extraction and the /extract endpoint. Leave blank to disable.
+              - key: OPENAI_API_KEY
+                sync: false
+              # Optional outbound proxy. Leave blank if you don't use one.
+              - key: PROXY_SERVER
+                sync: false
+              - key: PROXY_USERNAME
+                sync: false
+              - key: PROXY_PASSWORD
+                sync: false
+              # Optional SearXNG endpoint to replace Google search.
+              - key: SEARXNG_ENDPOINT
+                sync: false
+
+          - type: pserv
+            name: firecrawl-playwright
+            runtime: image
+            plan: standard
+            region: oregon
+            image:
+              url: ghcr.io/firecrawl/playwright-service:latest
+            envVars:
+              - key: PORT
+                value: "3000"
+              - key: MAX_CONCURRENT_PAGES
+                value: "5"
+              - key: BLOCK_MEDIA
+                value: "true"
+              - key: PROXY_SERVER
+                sync: false
+              - key: PROXY_USERNAME
+                sync: false
+              - key: PROXY_PASSWORD
+                sync: false
+
+          - type: pserv
+            name: firecrawl-postgres
+            runtime: image
+            plan: standard
+            region: oregon
+            image:
+              url: ghcr.io/firecrawl/nuq-postgres:latest
+            disk:
+              name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              sizeGB: 10
+            envVars:
+              # POSTGRES_DB stays "postgres" because the nuq-postgres image
+              # pins cron.database_name = 'postgres' in postgresql.conf.
+              # Changing this without rebuilding the image breaks pg_cron.
+              - key: POSTGRES_DB
+                value: postgres
+              - key: POSTGRES_USER
+                value: firecrawl
+              - key: POSTGRES_PASSWORD
+                generateValue: true
+              # Postgres refuses to initdb into a mountpoint that already has
+              # files (e.g. lost+found on a fresh disk). Use a subdir.
+              - key: PGDATA
+                value: /var/lib/postgresql/data/pgdata
+
+          - type: pserv
+            name: firecrawl-rabbitmq
+            runtime: image
+            plan: starter
+            region: oregon
+            image:
+              url: docker.io/library/rabbitmq:3-management
+            # No disk on purpose. RabbitMQ here is only the pg_notify
+            # transport for real-time worker notifications; the
+            # authoritative queue state lives in firecrawl-postgres
+            # (the nuq.* tables). Losing rabbit's in-memory state on
+            # restart just makes workers re-poll Postgres on the next
+            # tick. Mounting a Render disk at /var/lib/rabbitmq breaks
+            # the Erlang cookie file's owner-only permission check on
+            # subsequent boots, so we keep rabbit ephemeral.
+
+          - type: keyvalue
+            name: firecrawl-redis
+            plan: starter
+            region: oregon
+            maxmemoryPolicy: noeviction
+            ipAllowList: []
